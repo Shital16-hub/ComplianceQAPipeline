@@ -62,8 +62,8 @@ def index_docs():
         logger.info("Initializing Azure OpenAI Embeddings...")
         embeddings = AzureOpenAIEmbeddings(
             azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-small"),
-            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_EMBEDDING_API_KEY"),
             openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
         )
         logger.info("✓ Embeddings model initialized successfully")

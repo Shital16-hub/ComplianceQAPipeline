@@ -1,57 +1,75 @@
 import json
 import os
 import logging
-import re  # <--- Added Regex for cleaning
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel, Field
 
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain_community.vectorstores import AzureSearch
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# Import the State schema .
 from backend.src.graph.state import VideoAuditState, ComplianceIssue
-
-# Import the Service
 from backend.src.services.video_indexer import VideoIndexerService
 
-# Configure Logger
 logger = logging.getLogger("brand-guardian")
 logging.basicConfig(level=logging.INFO)
 
-# --- NODE 1: THE INDEXER ---
+
+# ============================================================
+# PYDANTIC SCHEMAS — Replaces manual JSON prompt instructions
+# ============================================================
+
+class ComplianceViolation(BaseModel):
+    """A single compliance violation found in the video."""
+    category: str = Field(
+        description="Category of violation e.g. 'Claim Validation', 'Endorsement Disclosure'"
+    )
+    severity: str = Field(
+        description="Either CRITICAL or WARNING"
+    )
+    description: str = Field(
+        description="Detailed explanation of the violation found"
+    )
+
+class AuditResult(BaseModel):
+    """Complete audit result returned by the compliance auditor."""
+    compliance_results: List[ComplianceViolation] = Field(
+        description="List of all compliance violations found. Empty list if none."
+    )
+    status: str = Field(
+        description="Overall audit status. Must be exactly PASS or FAIL"
+    )
+    final_report: str = Field(
+        description="Professional summary of all findings for the compliance report"
+    )
+
+
+# ============================================================
+# NODE 1: THE INDEXER (unchanged)
+# ============================================================
 def index_video_node(state: VideoAuditState) -> Dict[str, Any]:
-    """
-    Downloads YouTube video, uploads to Azure VI, and extracts insights.
-    """
+    """Downloads YouTube video, uploads to Azure VI, and extracts insights."""
     video_url = state.get("video_url")
     video_id_input = state.get("video_id", "vid_demo")
     
     logger.info(f"--- [Node: Indexer] Processing: {video_url} ---")
-    
     local_filename = "temp_audit_video.mp4"
     
     try:
         vi_service = VideoIndexerService()
         
-        # 1. DOWNLOAD
         if "youtube.com" in video_url or "youtu.be" in video_url:
             local_path = vi_service.download_youtube_video(video_url, output_path=local_filename)
         else:
             raise Exception("Please provide a valid YouTube URL for this test.")
 
-        # 2. UPLOAD
         azure_video_id = vi_service.upload_video(local_path, video_name=video_id_input)
         logger.info(f"Upload Success. Azure ID: {azure_video_id}")
         
-        # 3. CLEANUP
         if os.path.exists(local_path):
             os.remove(local_path)
 
-        # 4. WAIT
         raw_insights = vi_service.wait_for_processing(azure_video_id)
-        
-        # 5. EXTRACT
         clean_data = vi_service.extract_data(raw_insights)
         
         logger.info("--- [Node: Indexer] Extraction Complete ---")
@@ -62,16 +80,17 @@ def index_video_node(state: VideoAuditState) -> Dict[str, Any]:
         return {
             "errors": [str(e)],
             "final_status": "FAIL",
-            "transcript": "", 
+            "transcript": "",
             "ocr_text": []
         }
 
-# --- NODE 2: THE COMPLIANCE AUDITOR ---
+
+# ============================================================
+# NODE 2: THE COMPLIANCE AUDITOR — Now with Pydantic
+# ============================================================
 def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
-    """
-    Performs Retrieval-Augmented Generation (RAG) to audit the content.
-    """
-    logger.info("--- [Node: Auditor] querying Knowledge Base & LLM ---")
+    """Performs RAG audit using structured Pydantic output."""
+    logger.info("--- [Node: Auditor] Querying Knowledge Base & LLM ---")
     
     transcript = state.get("transcript", "")
     
@@ -82,16 +101,24 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
             "final_report": "Audit skipped because video processing failed (No Transcript)."
         }
 
-    # Initialize Clients
+    # --- Initialize LLM ---
     llm = AzureChatOpenAI(
         azure_deployment=os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT"),
         openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
         temperature=0.0
     )
 
+    # --- Bind Pydantic schema to LLM ---
+    # This replaces the manual JSON instructions in the prompt
+    # LangChain forces the LLM to return exactly this structure
+    structured_llm = llm.with_structured_output(AuditResult)
+
+    # --- Initialize Embeddings & Vector Store ---
     embeddings = AzureOpenAIEmbeddings(
-        azure_deployment="text-embedding-3-small",
-        openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_EMBEDDING_ENDPOINT"),
+        api_key=os.getenv("AZURE_OPENAI_EMBEDDING_API_KEY"),
+        openai_api_version="2024-12-01-preview",
     )
 
     vector_store = AzureSearch(
@@ -101,14 +128,13 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
         embedding_function=embeddings.embed_query
     )
     
-    # RAG Retrieval
+    # --- RAG Retrieval ---
     ocr_text = state.get("ocr_text", [])
     query_text = f"{transcript} {' '.join(ocr_text)}"
     docs = vector_store.similarity_search(query_text, k=3)
-    
     retrieved_rules = "\n\n".join([doc.page_content for doc in docs])
     
-    # --- UPDATED PROMPT WITH STRICT SCHEMA ---
+    # --- Cleaner Prompt — No manual JSON schema needed ---
     system_prompt = f"""
     You are a Senior Brand Compliance Auditor.
     
@@ -116,23 +142,12 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
     {retrieved_rules}
     
     INSTRUCTIONS:
-    1. Analyze the Transcript and OCR text below.
-    2. Identify ANY violations of the rules.
-    3. Return strictly JSON in the following format:
-    
-    {{
-        "compliance_results": [
-            {{
-                "category": "Claim Validation",
-                "severity": "CRITICAL",
-                "description": "Explanation of the violation..."
-            }}
-        ],
-        "status": "FAIL", 
-        "final_report": "Summary of findings..."
-    }}
-
-    If no violations are found, set "status" to "PASS" and "compliance_results" to [].
+    1. Analyze the Transcript and OCR text provided.
+    2. Identify ALL violations of the rules above.
+    3. For each violation specify the category, severity (CRITICAL or WARNING), 
+       and a detailed description.
+    4. Set status to PASS only if zero violations are found, otherwise FAIL.
+    5. Write a professional final_report summarizing your findings.
     """
 
     user_message = f"""
@@ -142,30 +157,27 @@ def audit_content_node(state: VideoAuditState) -> Dict[str, Any]:
     """
 
     try:
-        response = llm.invoke([
+        # --- Invoke structured LLM ---
+        # Returns AuditResult Pydantic object directly — no JSON parsing needed
+        audit_result: AuditResult = structured_llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_message)
         ])
-        
-        # --- FIX: Clean Markdown if present (```json ... ```) ---
-        content = response.content
-        if "```" in content:
-            # Regex to find JSON inside code blocks
-            content = re.search(r"```(?:json)?(.*?)```", content, re.DOTALL).group(1)
-            
-        audit_data = json.loads(content.strip())
-        
+
+        logger.info(f"Audit complete. Status: {audit_result.status}")
+        logger.info(f"Violations found: {len(audit_result.compliance_results)}")
+
+        # --- Convert Pydantic objects to dicts for the graph state ---
         return {
-            "compliance_results": audit_data.get("compliance_results", []),
-            "final_status": audit_data.get("status", "FAIL"),
-            "final_report": audit_data.get("final_report", "No report generated.")
+            "compliance_results": [v.model_dump() for v in audit_result.compliance_results],
+            "final_status": audit_result.status,
+            "final_report": audit_result.final_report
         }
 
     except Exception as e:
         logger.error(f"System Error in Auditor Node: {str(e)}")
-        # Log the raw response to see what went wrong
-        logger.error(f"Raw LLM Response: {response.content if 'response' in locals() else 'None'}")
         return {
             "errors": [str(e)],
-            "final_status": "FAIL"
+            "final_status": "FAIL",
+            "final_report": f"Audit failed due to system error: {str(e)}"
         }
